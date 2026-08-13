@@ -1,11 +1,13 @@
 "use client";
 
 import { format } from "date-fns";
-import { Send, TestTube } from "lucide-react";
+import { Send, TestTube, Unplug } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { testIntegrationConnection } from "@/actions/integrations/integrations";
 import {
+  disconnectSlackIntegration,
+  getSlackAuthorizeUrl,
   getSlackChannels,
   sendSlackTestMessage,
   setSlackDefaultChannel,
@@ -23,6 +25,7 @@ import {
   CardHeader,
   useToast,
 } from "@/components/shadcn";
+import { Modal } from "@/components/shadcn/modal";
 import type {
   IntegrationProps,
   SlackChannelOption,
@@ -33,6 +36,22 @@ interface TestMessageOutcome {
   sent: boolean;
   detail: string;
 }
+
+/**
+ * Slack answers that prove the stored token itself is unusable, rather than the
+ * channel unreachable (contract, Cross-cutting). They are what separates "this
+ * needs a new install" from "this needs a different channel", so they get their
+ * own state instead of a generic failure.
+ */
+const CREDENTIAL_REVOKED_SIGNALS = [
+  "token_revoked",
+  "invalid_auth",
+  "account_inactive",
+] as const;
+
+const isCredentialRevoked = (reason: string | undefined): boolean =>
+  reason !== undefined &&
+  CREDENTIAL_REVOKED_SIGNALS.some((signal) => reason.includes(signal));
 
 interface SlackIntegrationManagerProps {
   /** The tenant's Slack integration — at most one exists (one workspace). */
@@ -55,6 +74,24 @@ export const SlackIntegrationManager = ({
   loadError,
 }: SlackIntegrationManagerProps) => {
   const [isTesting, setIsTesting] = useState(false);
+  const [isDisconnectOpen, setIsDisconnectOpen] = useState(false);
+  const [isDisconnecting, setIsDisconnecting] = useState(false);
+  // Local state after a mutation: the row is gone the moment the API says so,
+  // and this page is what the user is looking at. The server component's own
+  // revalidation refreshes the same thing on the next navigation.
+  const [disconnected, setDisconnected] = useState(false);
+  /** Slack's reason when a disconnect removed the row but could not revoke. */
+  const [revocationFailure, setRevocationFailure] = useState<string | null>(
+    null,
+  );
+  /** Slack's reason when it stopped accepting the stored token. */
+  const [credentialFailure, setCredentialFailure] = useState<string | null>(
+    null,
+  );
+  // A connected workspace arrives with no consent URL — there is no install left
+  // to start (design D10) — so one is minted only if the page turns out to need
+  // it: after a disconnect, or once the credential is known to be dead.
+  const [mintedInstallUrl, setMintedInstallUrl] = useState<string | null>(null);
   const { toast } = useToast();
 
   const integrationId = integration?.id ?? null;
@@ -197,18 +234,30 @@ export const SlackIntegrationManager = ({
     }
   };
 
+  const mintInstallUrl = async () => {
+    const result = await getSlackAuthorizeUrl();
+    if ("authorizeUrl" in result) setMintedInstallUrl(result.authorizeUrl);
+  };
+
   const handleTestConnection = async (id: string) => {
     setIsTesting(true);
     try {
       const result = await testIntegrationConnection(id);
 
       if (result.success) {
+        setCredentialFailure(null);
         toast({
           title: "Connection test successful!",
           description:
             result.message || "Prowler can reach your Slack workspace.",
         });
       } else {
+        // A dead token is not a failure the user can fix by checking again, so
+        // it gets its own state and an offer to approve Prowler again.
+        if (isCredentialRevoked(result.error)) {
+          setCredentialFailure(result.error ?? null);
+          void mintInstallUrl();
+        }
         toast({
           variant: "destructive",
           title: "Connection test failed",
@@ -223,6 +272,59 @@ export const SlackIntegrationManager = ({
       });
     } finally {
       setIsTesting(false);
+    }
+  };
+
+  const handleDisconnect = async (id: string) => {
+    const workspace =
+      integration?.attributes.configuration.team_name ?? "your Slack workspace";
+
+    setIsDisconnecting(true);
+    try {
+      const result = await disconnectSlackIntegration(id);
+
+      if ("error" in result) {
+        toast({
+          variant: "destructive",
+          title: "Disconnect failed",
+          description: result.error,
+        });
+        return;
+      }
+
+      const { revoked, error } = result.revocation;
+
+      // The integration is gone whatever Slack answered, so the page goes back
+      // to its unconnected state either way — with a consent URL ready, so
+      // connecting again is a click rather than a reload.
+      setDisconnected(true);
+      setCredentialFailure(null);
+      // Only an explicit "not revoked" sends the user to finish the job in
+      // Slack. An unreported outcome is neither a failed revocation nor a
+      // confirmed one, so it claims neither.
+      setRevocationFailure(
+        revoked === false ? (error ?? "Slack gave no reason") : null,
+      );
+      void mintInstallUrl();
+
+      if (revoked !== false) {
+        toast({
+          title: "Slack workspace disconnected",
+          description:
+            revoked === true
+              ? `Prowler's access to ${workspace} has been revoked.`
+              : `${workspace} is no longer connected to Prowler.`,
+        });
+      }
+    } catch (_error) {
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: "Failed to disconnect Slack. Please try again.",
+      });
+    } finally {
+      setIsDisconnecting(false);
+      setIsDisconnectOpen(false);
     }
   };
 
@@ -241,6 +343,7 @@ export const SlackIntegrationManager = ({
 
   const configuration = integration?.attributes.configuration;
   const workspaceName = configuration?.team_name;
+  const installUrl = mintedInstallUrl ?? authorizeUrl;
 
   return (
     <div className="flex flex-col gap-6">
@@ -251,6 +354,37 @@ export const SlackIntegrationManager = ({
         </Alert>
       )}
 
+      {/* Portaled by Radix, so its place in this tree costs no layout. */}
+      <Modal
+        open={isDisconnectOpen}
+        onOpenChange={setIsDisconnectOpen}
+        title="Disconnect Slack workspace"
+        description={`Prowler will revoke its access at Slack and stop posting to ${workspaceName ?? "this workspace"}. Connecting again means approving Prowler in Slack.`}
+      >
+        <div className="flex w-full justify-end gap-4">
+          <Button
+            type="button"
+            variant="ghost"
+            size="lg"
+            disabled={isDisconnecting}
+            onClick={() => setIsDisconnectOpen(false)}
+          >
+            Cancel
+          </Button>
+
+          <Button
+            type="button"
+            variant="destructive"
+            size="lg"
+            disabled={isDisconnecting}
+            onClick={() => integration && handleDisconnect(integration.id)}
+          >
+            {!isDisconnecting && <Unplug size={20} />}
+            {isDisconnecting ? "Disconnecting..." : "Disconnect workspace"}
+          </Button>
+        </div>
+      </Modal>
+
       {loadError && (
         <Alert variant="error">
           <AlertTitle>Could not load your Slack integration</AlertTitle>
@@ -258,7 +392,46 @@ export const SlackIntegrationManager = ({
         </Alert>
       )}
 
-      {integration ? (
+      {revocationFailure && (
+        <Alert variant="warning">
+          <AlertTitle>
+            Slack disconnected — remove Prowler&apos;s access in Slack
+          </AlertTitle>
+          <AlertDescription>
+            The integration and the token Prowler had stored are gone from
+            Prowler, so there is nothing to retry here. Slack did not confirm
+            the revocation ({revocationFailure}), so the Prowler app may still
+            be installed in {workspaceName ?? "the workspace"} — remove it from
+            that workspace&apos;s Slack app settings.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {credentialFailure && (
+        <Alert variant="error">
+          <AlertTitle>
+            Prowler&apos;s access to {workspaceName ?? "this workspace"} has
+            been revoked
+          </AlertTitle>
+          <AlertDescription>
+            Slack no longer accepts the token Prowler stored (
+            {credentialFailure}), so Prowler cannot post to this workspace.
+            Approve Prowler in Slack again to restore access.
+          </AlertDescription>
+          {installUrl && (
+            <div className="col-start-2 mt-3">
+              <Button asChild size="sm">
+                <a href={installUrl} rel="noopener noreferrer">
+                  <SlackIcon size={16} />
+                  Reconnect to Slack
+                </a>
+              </Button>
+            </div>
+          )}
+        </Alert>
+      )}
+
+      {integration && !disconnected ? (
         <Card variant="base">
           <CardHeader>
             <IntegrationCardHeader
@@ -266,7 +439,11 @@ export const SlackIntegrationManager = ({
               title={`Connected to ${workspaceName ?? "your Slack workspace"}`}
               subtitle="Prowler posts to this workspace only."
               connectionStatus={{
-                connected: integration.attributes.connected === true,
+                // A check that came back with a dead token outranks the state
+                // the page was loaded with.
+                connected:
+                  integration.attributes.connected === true &&
+                  credentialFailure === null,
               }}
             />
           </CardHeader>
@@ -286,15 +463,26 @@ export const SlackIntegrationManager = ({
                   </p>
                 )}
               </div>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={isTesting}
-                onClick={() => handleTestConnection(integration.id)}
-              >
-                <TestTube size={14} />
-                {isTesting ? "Testing..." : "Test connection"}
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={isTesting}
+                  onClick={() => handleTestConnection(integration.id)}
+                >
+                  <TestTube size={14} />
+                  {isTesting ? "Testing..." : "Test connection"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={isDisconnecting}
+                  onClick={() => setIsDisconnectOpen(true)}
+                >
+                  <Unplug size={14} />
+                  Disconnect
+                </Button>
+              </div>
             </div>
 
             <div className="border-border-neutral-secondary mt-6 flex flex-col gap-4 border-t pt-6">
@@ -374,9 +562,9 @@ export const SlackIntegrationManager = ({
                 Prowler asks for permission to post messages and to read the
                 workspace&apos;s channel list.
               </p>
-              {authorizeUrl ? (
+              {installUrl ? (
                 <Button asChild>
-                  <a href={authorizeUrl} rel="noopener noreferrer">
+                  <a href={installUrl} rel="noopener noreferrer">
                     <SlackIcon size={16} />
                     Add to Slack
                   </a>

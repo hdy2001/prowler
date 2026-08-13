@@ -91,6 +91,18 @@ export interface SlackRefusalFixture {
   retryAfterSeconds: number | null;
 }
 
+/**
+ * What `DELETE /integrations/{id}` reports about revoking the token at Slack.
+ * Revocation is best-effort: the row goes either way, and the outcome travels in
+ * JSON:API `meta` so the UI can say when access still needs removing by hand.
+ */
+export interface SlackRevocationFixture {
+  /** Slack confirmed the token no longer grants Prowler anything. */
+  revoked: boolean;
+  /** Slack's reason when it did not. */
+  error: string | null;
+}
+
 export interface SlackFixture {
   /**
    * The deployment has `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` /
@@ -128,6 +140,8 @@ export interface SlackFixture {
   channelSaveRefusal: SlackRefusalFixture | null;
   /** What the test-message task settles as. */
   testMessage: SlackTestMessageFixture;
+  /** What disconnecting reports about revoking the token at Slack. */
+  revocation: SlackRevocationFixture;
 }
 
 export const SLACK_INTEGRATION_ID = "slack-integration-1";
@@ -290,6 +304,18 @@ export const SLACK_CHANNELS_PAGE_SIZE = 2;
  */
 export const SLACK_DEFAULT_CHANNEL = SLACK_PUBLIC_CHANNEL;
 
+/**
+ * Slack's reason when `auth.revoke` could not be delivered while disconnecting.
+ * The row is still gone; only the revocation failed.
+ */
+export const SLACK_REVOKE_FAILURE_REASON = "invalid_auth";
+
+/**
+ * What Slack answers once a workspace admin has revoked Prowler's token, so any
+ * call made with it proves the credential unusable (contract, Cross-cutting).
+ */
+export const SLACK_TOKEN_REVOKED_REASON = "token_revoked";
+
 const PROWLER_HQ: SlackWorkspaceFixture = {
   teamId: "T01PROWLER",
   teamName: "Prowler HQ",
@@ -310,6 +336,7 @@ export const slackFixture = (
   channelsRefusal: null,
   channelSaveRefusal: null,
   testMessage: { accepted: true, error: null },
+  revocation: { revoked: true, error: null },
   ...overrides,
 });
 
@@ -364,3 +391,29 @@ export const configuredSlackFixture = (
   overrides: Partial<SlackFixture> = {},
 ): SlackFixture =>
   slackFixtureWithDefaultChannel(SLACK_DEFAULT_CHANNEL, overrides);
+
+/**
+ * A connected tenant whose disconnect removes the row but cannot revoke at
+ * Slack — the outcome the user has to finish by hand in the workspace.
+ */
+export const revokeFailureSlackFixture = (
+  overrides: Partial<SlackFixture> = {},
+): SlackFixture =>
+  connectedSlackFixture({
+    revocation: { revoked: false, error: SLACK_REVOKE_FAILURE_REASON },
+    ...overrides,
+  });
+
+/**
+ * A connected tenant whose token has been revoked at Slack: the row still says
+ * connected until a check runs, and the check is what surfaces it. The check
+ * itself needs a destination channel on record — the API refuses to test one
+ * that has none — so this builds on the finished setup, not the bare install.
+ */
+export const revokedTokenSlackFixture = (
+  overrides: Partial<SlackFixture> = {},
+): SlackFixture =>
+  configuredSlackFixture({
+    connection: { connected: false, error: SLACK_TOKEN_REVOKED_REASON },
+    ...overrides,
+  });

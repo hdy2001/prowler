@@ -72,7 +72,13 @@ export interface IntegrationProps {
     inserted_at: string;
     updated_at: string;
     enabled: boolean;
-    connected: boolean;
+    /**
+     * `null` until the first connection check runs — the OAuth exchange creates
+     * a Slack integration in exactly that state — so "not connected" and "never
+     * checked" are different answers. Compare against `true`/`false`; a bare
+     * truthiness check reads an unchecked integration as a broken one.
+     */
+    connected: boolean | null;
     connection_last_checked_at: string | null;
     integration_type: IntegrationType;
     configuration: {
