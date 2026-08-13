@@ -24,14 +24,17 @@ import {
   SLACK_INVALID_CODE_DETAIL,
   SLACK_NO_CHANNEL_DETAIL,
   SLACK_NO_DEFAULT_CHANNEL_DETAIL,
-  SLACK_RATE_LIMITED_DETAIL,
+  SLACK_RATE_LIMITED_REFUSAL,
   SLACK_REFUSED_STATE_DETAIL,
-  SLACK_RETRY_AFTER_SECONDS,
   SLACK_UNCONFIGURED_DETAIL,
   SLACK_UNKNOWN_CHANNEL_DETAIL,
   SLACK_WORKSPACE_CONFLICT_CODE,
 } from "./slack.fixtures";
-import type { SlackFixture, SlackInstallFixture } from "./slack.fixtures";
+import type {
+  SlackFixture,
+  SlackInstallFixture,
+  SlackRefusalFixture,
+} from "./slack.fixtures";
 
 const API = process.env.UI_API_BASE_URL;
 const TS = "2026-08-10T09:00:00Z";
@@ -60,6 +63,22 @@ const errorBody = (detail: string, status: number, code?: string) => ({
     },
   ],
 });
+
+/**
+ * Answer a fixture's refusal exactly as the API would: its own status, its
+ * `code` when it names one, and `Retry-After` only where the status carries a
+ * wait. A consumer that reads any of the three gets the real thing.
+ */
+const refuse = (refusal: SlackRefusalFixture) =>
+  HttpResponse.json(
+    errorBody(refusal.detail, refusal.status, refusal.code ?? undefined),
+    {
+      status: refusal.status,
+      ...(refusal.retryAfterSeconds === null
+        ? {}
+        : { headers: { "Retry-After": String(refusal.retryAfterSeconds) } }),
+    },
+  );
 
 const configuration = (workspace: SlackInstallFixture["workspace"]) => ({
   team_id: workspace.teamId,
@@ -122,11 +141,7 @@ export const handlersForSlack = (fx: SlackFixture) => {
    * neither a refusal the user can act on nor "no Slack app here", so it names
    * no `code`: the status is the whole reason.
    */
-  const rateLimited = () =>
-    HttpResponse.json(errorBody(SLACK_RATE_LIMITED_DETAIL, 429), {
-      status: 429,
-      headers: { "Retry-After": String(SLACK_RETRY_AFTER_SECONDS) },
-    });
+  const rateLimited = () => refuse(SLACK_RATE_LIMITED_REFUSAL);
 
   return [
     // --- OAuth ------------------------------------------------------------
@@ -246,11 +261,10 @@ export const handlersForSlack = (fx: SlackFixture) => {
     http.get<{ id: string }>(
       `${API}/integrations/:id/slack/channels`,
       ({ params, request }) => {
-        if (fx.channelsError) {
-          return HttpResponse.json(errorBody(fx.channelsError, 400), {
-            status: 400,
-          });
-        }
+        // A refusal named for this endpoint wins over the fixture's blanket
+        // rate limiting, which is the coarser switch of the two.
+        if (fx.channelsRefusal) return refuse(fx.channelsRefusal);
+        if (fx.rateLimited) return rateLimited();
 
         // Cursor pagination: the UI follows `links.next` opaquely, so the
         // cursor's shape is this fixture's business alone.
@@ -292,6 +306,9 @@ export const handlersForSlack = (fx: SlackFixture) => {
       if (!install) {
         return HttpResponse.json(errorBody("Not found.", 404), { status: 404 });
       }
+      // Slack refused the channel while the API validated it: the id resolves
+      // to a channel the picker offered, and Slack still says no.
+      if (fx.channelSaveRefusal) return refuse(fx.channelSaveRefusal);
       if (!channel) {
         return HttpResponse.json(errorBody(SLACK_UNKNOWN_CHANNEL_DETAIL, 400), {
           status: 400,
