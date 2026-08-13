@@ -54,6 +54,15 @@ interface SlackRateLimited {
 
 interface SlackActionError {
   error: string;
+  /**
+   * The refusal's `code`, when it named one, alongside the copy.
+   *
+   * A caller reads it to recognise a *class* of failure the wording cannot be
+   * pattern-matched for — a Slack grant that has stopped working, which the
+   * contract says can surface from any of these calls (Cross-cutting) and which
+   * is recovered from by reconnecting rather than by retrying.
+   */
+  code?: string | null;
 }
 
 interface SlackAuthorizeUrl {
@@ -116,28 +125,34 @@ const failureFrom = async (
     };
   }
 
-  return { error: slackErrorMessage(failure, fallback) };
+  return { error: slackErrorMessage(failure, fallback), code: failure.code };
 };
 
 /**
- * The same classification flattened to one line of copy, for the calls whose
- * only outcome is "it did not work": the code's own wording when Prowler has
- * one, the API's `detail` when it does not, and `fallback` when neither.
+ * The same classification flattened to one refusal, for the calls whose only
+ * outcome is "it did not work": the code's own wording when Prowler has one,
+ * the API's `detail` when it does not, and `fallback` when neither — with the
+ * `code` itself carried alongside, unworded, for the caller that has to act on
+ * the class rather than show the sentence.
  *
  * Rate limiting is part of that line rather than folded into the generic
  * wording. `conversations.list` is Slack tier 2, so the channel listing is
  * where a `429` actually shows up (contract, Errors), and answering it without
  * the wait turns "come back in half a minute" into a dead end.
  */
-const errorMessageFrom = async (
+const refusalFrom = async (
   response: Response,
   fallback: string,
-): Promise<string> => {
+): Promise<SlackActionError> => {
   const failure = await readSlackFailure(response);
 
-  return failure.status === RATE_LIMITED_STATUS
-    ? slackRateLimitMessage(failure.retryAfterSeconds)
-    : slackErrorMessage(failure, fallback);
+  return {
+    error:
+      failure.status === RATE_LIMITED_STATUS
+        ? slackRateLimitMessage(failure.retryAfterSeconds)
+        : slackErrorMessage(failure, fallback),
+    code: failure.code,
+  };
 };
 
 /**
@@ -259,12 +274,10 @@ export const getSlackChannels = async (
       const response: Response = await fetch(next, { method: "GET", headers });
 
       if (!response.ok) {
-        return {
-          error: await errorMessageFrom(
-            response,
-            `Unable to read the workspace's channels: ${response.statusText}`,
-          ),
-        };
+        return refusalFrom(
+          response,
+          `Unable to read the workspace's channels: ${response.statusText}`,
+        );
       }
 
       const body = await response.json();
@@ -338,12 +351,10 @@ export const setSlackDefaultChannel = async (
     });
 
     if (!response.ok) {
-      return {
-        error: await errorMessageFrom(
-          response,
-          `Unable to save the destination channel: ${response.statusText}`,
-        ),
-      };
+      return refusalFrom(
+        response,
+        `Unable to save the destination channel: ${response.statusText}`,
+      );
     }
 
     const body = await response.json();
@@ -390,12 +401,10 @@ export const sendSlackTestMessage = async (
     const response = await fetch(url.toString(), { method: "POST", headers });
 
     if (!response.ok) {
-      return {
-        error: await errorMessageFrom(
-          response,
-          `Unable to send the test message: ${response.statusText}`,
-        ),
-      };
+      return refusalFrom(
+        response,
+        `Unable to send the test message: ${response.statusText}`,
+      );
     }
 
     const body = await response.json();
@@ -426,7 +435,12 @@ export const sendSlackTestMessage = async (
     // that did not complete is a failure even when it names no reason at all.
     const reason = settled.result?.error?.trim();
     if (reason) {
-      return { error: slackErrorMessage({ code: reason, detail: reason }) };
+      return {
+        error: slackErrorMessage({ code: reason, detail: reason }),
+        // A dead grant can surface here as much as anywhere else, so the reason
+        // travels on as the class it is, not only as the sentence it became.
+        code: reason,
+      };
     }
     if (settled.state !== "completed") {
       return { error: "Slack did not accept the test message." };
@@ -438,7 +452,12 @@ export const sendSlackTestMessage = async (
   }
 };
 
-/** What the API reports about revoking Prowler's token at Slack. */
+/**
+ * What the API reports about revoking Prowler's token at Slack: one boolean in
+ * `meta`, and nothing else. The API sends no reason for a revocation that did
+ * not happen, so there is none to report — and a UI that invented a place to
+ * put one would be promising the user an explanation it can never fill in.
+ */
 export interface SlackRevocation {
   /**
    * Whether Slack confirmed the token no longer grants Prowler anything, or
@@ -447,8 +466,6 @@ export interface SlackRevocation {
    * than the revocation — and neither answer is claimed on the user's behalf.
    */
   revoked: boolean | null;
-  /** Slack's reason when it did not, when it gave one. */
-  error: string | null;
 }
 
 interface SlackDisconnectSuccess {
@@ -484,12 +501,10 @@ export const disconnectSlackIntegration = async (
     const response = await fetch(url.toString(), { method: "DELETE", headers });
 
     if (!response.ok) {
-      return {
-        error: await errorMessageFrom(
-          response,
-          `Unable to disconnect the Slack workspace: ${response.statusText}`,
-        ),
-      };
+      return refusalFrom(
+        response,
+        `Unable to disconnect the Slack workspace: ${response.statusText}`,
+      );
     }
 
     const body = await response.json().catch(() => ({}));
@@ -502,10 +517,6 @@ export const disconnectSlackIntegration = async (
       disconnected: true,
       revocation: {
         revoked: typeof meta.revoked === "boolean" ? meta.revoked : null,
-        error:
-          typeof meta.revocation_error === "string"
-            ? meta.revocation_error
-            : null,
       },
     };
   } catch (error) {
