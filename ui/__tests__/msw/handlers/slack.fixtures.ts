@@ -54,6 +54,21 @@ export interface SlackConnectionFixture {
   error: string | null;
 }
 
+/** A channel the listing endpoint offers for the picker. */
+export interface SlackChannelFixture {
+  id: string;
+  name: string;
+  /** Private channels are listed only where `@Prowler` has been invited. */
+  isPrivate: boolean;
+}
+
+export interface SlackTestMessageFixture {
+  /** Slack accepted the post. */
+  accepted: boolean;
+  /** Slack's own reason when it did not, as the task result carries it. */
+  error: string | null;
+}
+
 export interface SlackFixture {
   /**
    * The deployment has `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` /
@@ -73,6 +88,18 @@ export interface SlackFixture {
    * Slack-backed endpoints answer the same way.
    */
   rateLimited: boolean;
+  /** Every channel the connected workspace exposes to Prowler. */
+  channels: SlackChannelFixture[];
+  /**
+   * Channels per cursor page. Small on purpose: the default workspace spans
+   * two pages, so a UI that stopped at `data` instead of following `links.next`
+   * would visibly lose channels.
+   */
+  channelsPageSize: number;
+  /** Slack refused the listing outright; its reason travels in `detail`. */
+  channelsError: string | null;
+  /** What the test-message task settles as. */
+  testMessage: SlackTestMessageFixture;
 }
 
 export const SLACK_INTEGRATION_ID = "slack-integration-1";
@@ -122,6 +149,14 @@ export const SLACK_NO_CHANNEL_DETAIL =
   "This Slack integration has no channel configured.";
 export const SLACK_RATE_LIMITED_DETAIL =
   "Slack is rate limiting requests from Prowler.";
+export const SLACK_CHANNELS_REFUSED_DETAIL =
+  "Slack refused the channel list: ratelimited.";
+export const SLACK_UNKNOWN_CHANNEL_DETAIL =
+  "That channel is not one Prowler can post to.";
+export const SLACK_NO_DEFAULT_CHANNEL_DETAIL =
+  "No default channel is recorded on this integration.";
+export const SLACK_TEST_MESSAGE_REFUSED_DETAIL =
+  "Slack rejected the message: channel_not_found.";
 
 /**
  * The `code` a different-workspace refusal is named by. A wire value, spelled
@@ -133,11 +168,43 @@ export const SLACK_WORKSPACE_CONFLICT_CODE = "slack_workspace_conflict";
 /** What `Retry-After` carries on a rate-limited answer. */
 export const SLACK_RETRY_AFTER_SECONDS = 30;
 
-/** The channel a finished install posts to. */
-export const SLACK_DEFAULT_CHANNEL = {
+/**
+ * The workspace's channels: two public, and one private the Prowler app has
+ * been invited to. Ordered so the private one lands on the second cursor page
+ * at the default page size — following `links.next` is what makes it visible.
+ */
+export const SLACK_PUBLIC_CHANNEL: SlackChannelFixture = {
   id: "C0123AB",
   name: "security",
-} as const;
+  isPrivate: false,
+};
+
+export const SLACK_SECOND_PUBLIC_CHANNEL: SlackChannelFixture = {
+  id: "C0789EF",
+  name: "platform",
+  isPrivate: false,
+};
+
+export const SLACK_PRIVATE_CHANNEL: SlackChannelFixture = {
+  id: "C0456CD",
+  name: "security-alerts",
+  isPrivate: true,
+};
+
+export const SLACK_CHANNELS: SlackChannelFixture[] = [
+  SLACK_PUBLIC_CHANNEL,
+  SLACK_SECOND_PUBLIC_CHANNEL,
+  SLACK_PRIVATE_CHANNEL,
+];
+
+/** Two channels per page, so `SLACK_CHANNELS` spans exactly two pages. */
+export const SLACK_CHANNELS_PAGE_SIZE = 2;
+
+/**
+ * The channel a finished install posts to: the first one the picker offers, so
+ * an install seeded with it always points at a channel the listing really has.
+ */
+export const SLACK_DEFAULT_CHANNEL = SLACK_PUBLIC_CHANNEL;
 
 const PROWLER_HQ: SlackWorkspaceFixture = {
   teamId: "T01PROWLER",
@@ -154,6 +221,10 @@ export const slackFixture = (
   exchangeOutcome: SLACK_EXCHANGE_OUTCOME.CREATED,
   connection: { connected: true, error: null },
   rateLimited: false,
+  channels: SLACK_CHANNELS.map((channel) => ({ ...channel })),
+  channelsPageSize: SLACK_CHANNELS_PAGE_SIZE,
+  channelsError: null,
+  testMessage: { accepted: true, error: null },
   ...overrides,
 });
 
@@ -176,12 +247,12 @@ export const connectedSlackFixture = (
   });
 
 /**
- * The same tenant with its setup finished: a workspace connected *and* a
- * destination channel on record. Anything the API refuses until a channel
- * exists — the connection check among them — needs this fixture, not the bare
- * connected one.
+ * The same tenant, with a destination channel already on record — the state a
+ * second visit starts from, and the one that shows whether a later failure
+ * disturbs what was already saved.
  */
-export const configuredSlackFixture = (
+export const slackFixtureWithDefaultChannel = (
+  channel: SlackChannelFixture = SLACK_PUBLIC_CHANNEL,
   overrides: Partial<SlackFixture> = {},
 ): SlackFixture =>
   connectedSlackFixture({
@@ -191,9 +262,20 @@ export const configuredSlackFixture = (
       connectionLastCheckedAt: "2026-08-10T09:30:00Z",
       workspace: {
         ...PROWLER_HQ,
-        channelId: SLACK_DEFAULT_CHANNEL.id,
-        channelName: SLACK_DEFAULT_CHANNEL.name,
+        channelId: channel.id,
+        channelName: channel.name,
       },
     },
     ...overrides,
   });
+
+/**
+ * The same tenant with its setup finished: a workspace connected *and* a
+ * destination channel on record. Anything the API refuses until a channel
+ * exists — the connection check among them — needs this fixture, not the bare
+ * connected one.
+ */
+export const configuredSlackFixture = (
+  overrides: Partial<SlackFixture> = {},
+): SlackFixture =>
+  slackFixtureWithDefaultChannel(SLACK_DEFAULT_CHANNEL, overrides);
